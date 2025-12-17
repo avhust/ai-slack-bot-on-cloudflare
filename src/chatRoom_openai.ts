@@ -1,7 +1,8 @@
 // src/chatRoom.ts
 import { DurableObject } from "cloudflare:workers";
 import { Env } from "./index";
-import { STRATEGY_CONTEXT, SYSTEM_INSTRUCTIONS } from "./knowledge"; // Import the text
+import { STRATEGY_CONTEXT, SYSTEM_INSTRUCTIONS } from "./knowledge.js"; // Import the text
+import { MESSAGES_LIMIT } from "./const.js";
 
 export class ChatRoom extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
@@ -27,8 +28,8 @@ export class ChatRoom extends DurableObject<Env> {
     // @ts-ignore - raw result handling depends on specific driver version, usually an iterator or array
     const responseCount: number = [...countResult][0].count;
 
-    if (responseCount >= 100) {
-      await this.postToSlack(channel, "🛑 Conversation limit of 100 responses reached. Please start a new channel.");
+    if (responseCount >= MESSAGES_LIMIT) {
+      await this.postToSlack(channel, "🛑 Conversation limit of MESSAGES_LIMIT responses reached. Please start a new channel.");
       return;
     }
 

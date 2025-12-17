@@ -6,6 +6,7 @@ export interface Env {
   SLACK_SIGNING_SECRET: string;
   SLACK_BOT_TOKEN: string;
   OPENAI_API_KEY: string;
+  GEMINI_API_KEY: string;
 }
 
 export default {
@@ -46,4 +47,5 @@ export default {
 };
 
 // Re-export the Durable Object class so Cloudflare finds it
-export { ChatRoom } from "./chatRoom.js";
+export { ChatRoom } from "./chatRoom_gemini.js";
+// export { ChatRoom } from "./chatRoom_openai.js";
