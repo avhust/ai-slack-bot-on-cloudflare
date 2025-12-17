@@ -3,7 +3,7 @@ import { DurableObject } from "cloudflare:workers";
 import { Env } from "./index";
 import { STRATEGY_CONTEXT, SYSTEM_INSTRUCTIONS } from "./knowledge";
 import { MESSAGES_LIMIT } from "./const.js";
-import { extractText } from "unpdf"; // Import PDF parser
+import { extractText } from "unpdf"; // Ensure we use the PDF.js driver
 
 export class ChatRoom extends DurableObject<Env> {
     constructor(ctx: DurableObjectState, env: Env) {
@@ -22,6 +22,7 @@ export class ChatRoom extends DurableObject<Env> {
     async handleMessage(event: any) {
         const { text, channel, files, user, ts } = event;
 
+        // === FILE HANDLING ===
         if (files && files.length > 0) {
             await this.postToSlack(channel, "📄 I see a file. Processing...");
 
@@ -38,15 +39,14 @@ export class ChatRoom extends DurableObject<Env> {
                     await this.postToSlack(channel, `⚠️ I ignored *${file.title}* because it is not a PDF.`);
                 }
             }
-            return; // Stop here, don't send files to Gemini as chat text
+            return;
         }
 
         // === 1. Detect Image Request & Clean Text ===
         const wantsImage = text.includes("[IMAGE]");
-        // Remove the tag so it doesn't confuse the RAG search
         const cleanText = text.replace("[IMAGE]", "").replace(/<@[a-zA-Z0-9]+>/g, "").trim();
 
-        // 1. Check Limit (Same as before)
+        // 1. Check Limit
         const countResult = this.ctx.storage.sql.exec(
             `SELECT COUNT(*) as count FROM messages WHERE role = 'model'`
         );
@@ -57,66 +57,53 @@ export class ChatRoom extends DurableObject<Env> {
             await this.postToSlack(channel, "🛑 Conversation limit reached.");
             return;
         }
-        // 2. Clean Input & Save User Message
 
+        // 2. Save User Message
         this.ctx.storage.sql.exec(
             `INSERT INTO messages (role, content, timestamp) VALUES (?, ?, ?)`,
             "user", cleanText, Date.now()
         );
 
-        // 3. Retrieve History & Fix Roles
+        // 3. Retrieve History
         const historyCursor = this.ctx.storage.sql.exec(
             `SELECT role, content FROM messages ORDER BY id DESC LIMIT 10`
         );
         const historyRows = [...historyCursor].reverse();
 
-        // Map to Gemini structure, ensuring strict 'user' vs 'model' roles
         const contents = historyRows
             .filter((msg: any) => msg.role !== 'system')
             .map((msg: any) => {
                 let role = msg.role;
-                // Map old 'assistant' messages to 'model'
                 if (role === 'assistant') role = 'model';
-                // Fallback for safety
                 if (role !== 'user' && role !== 'model') role = 'model';
-
                 return {
                     role: role,
                     parts: [{ text: msg.content }]
                 };
             });
 
-
+        // 4. RAG Search
         const queryEmbedding = await this.env.AI.run("@cf/baai/bge-base-en-v1.5", {
-            text: [text]
+            text: [cleanText]
         });
 
-        // 2. Query Vectorize
         const vecMatches = await this.env.VECTOR_INDEX.query(queryEmbedding.data[0], {
-            topK: 3, // Get top 3 most relevant PDF chunks
-            returnMetadata: true // We need the text back
+            topK: 5,
+            returnMetadata: true
         });
 
-        // 3. Build Context String from matches
         const contextData = vecMatches.matches
             .map((match: any) => `SOURCE: ${match.metadata.source}\nCONTENT: ${match.metadata.content}`)
             .join("\n\n");
-        console.log("📚 Retrieved Context:\n", contextData);
+
         const systemInstruction = {
             parts: [{
-                text: `=== INITIAL CONTEXT ===\n${STRATEGY_CONTEXT}\n\n=== RETRIEVED KNOWLEDGE ===\n${contextData || "No relevant documents found"}.\n\n ${SYSTEM_INSTRUCTIONS}\n\n"}`
+                text: `=== CONTEXT ===\n${STRATEGY_CONTEXT}\n\n=== RETRIEVED KNOWLEDGE ===\n${contextData || "No relevant documents found"}.\n\n ${SYSTEM_INSTRUCTIONS}`
             }]
         };
 
-        // 4. Construct System Instruction
-        // const systemInstruction = {
-        //     parts: [{ text: `${SYSTEM_INSTRUCTIONS}\n\n=== CONTEXT ===\n${STRATEGY_CONTEXT}` }]
-        // };
-
-        // 5. Call Gemini 2.5 Flash API
-        // UPDATED MODEL STRING HERE:
-        // const modelVersion = "gemini-3-flash-preview"; // Change to "gemini-1.5-flash" if 2.5 is not available
-        const modelVersion = "gemini-2.5-flash"; // Change to "gemini-1.5-flash" if 2.5 is not available
+        // 5. Call Gemini
+        const modelVersion = "gemini-2.5-flash"; // Or gemini-1.5-flash
         const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelVersion}:generateContent?key=${this.env.GEMINI_API_KEY}`;
 
         const response = await fetch(url, {
@@ -125,46 +112,42 @@ export class ChatRoom extends DurableObject<Env> {
             body: JSON.stringify({
                 system_instruction: systemInstruction,
                 contents: contents,
-                generationConfig: {
-                    temperature: 0.9,
-                }
+                generationConfig: { temperature: 0.3 }
             }),
         });
 
         const data: any = await response.json();
 
-        // Error handling in case Gemini refuses or errors out
-        if (!data.candidates || data.candidates.length === 0) {
-            console.error("Gemini Error:", JSON.stringify(data));
-            await this.postToSlack(channel, "⚠️ I encountered an error processing that request.");
+        // === ERROR FIX 1: Check for candidates before accessing [0] ===
+        if (!data.candidates || !data.candidates[0]) {
+            console.error("Gemini Text Error:", JSON.stringify(data));
+            // Check if it's a safety block
+            const errorMsg = data.promptFeedback?.blockReason || data.error?.message || "Unknown API Error";
+            await this.postToSlack(channel, `⚠️ I couldn't generate a text reply. Reason: ${errorMsg}`);
             return;
         }
 
-        // const reply = data.candidates[0].content.parts[0].text;
         const textReply = data.candidates[0].content.parts[0].text;
 
-        // 6. Save Assistant Response (Role = 'model')
+        // 6. Save & Post Reply
         this.ctx.storage.sql.exec(
             `INSERT INTO messages (role, content, timestamp) VALUES (?, ?, ?)`,
             "model", textReply, Date.now()
         );
 
-        // 7. Post to Slack
-        await this.postToSlack(channel, textReply);
+        await this.postToSlack(channel, textReply, ts);
 
         // === 2. CONDITIONAL IMAGE GENERATION ===
         if (wantsImage) {
-            // Notify user that image is generating (it takes longer)
             await this.postToSlack(channel, "🎨 Generating infographic... please wait.", ts);
 
             try {
-                // A. Generate the prompt for the image
+                // A. Generate Prompt
                 const imagePrompt = await this.createInfographicPrompt(cleanText, textReply);
                 console.log("Generated Image Prompt:", imagePrompt);
 
-                // B. Generate and upload the image
-                // Using a currently available image model string. Update to 2.5 when available.
-                const imageModel = "imagen-3.0-generate-001";
+                // B. Generate Image
+                const imageModel = "gemini-2.5-flash-image";
                 await this.generateAndUploadImage(imagePrompt, channel, ts, imageModel);
 
             } catch (err: any) {
@@ -172,95 +155,58 @@ export class ChatRoom extends DurableObject<Env> {
                 await this.postToSlack(channel, `❌ Failed to generate image: ${err.message}`, ts);
             }
         }
-
     }
 
     async processSlackFile(file: any, channel: string) {
-        // 1. CHOOSE URL: 'url_private' is often more reliable for Bots than 'url_private_download'
-        // We try url_private first as it works better with Bearer tokens in headers
         const targetUrl = file.url_private;
-
         console.log(`⬇️ Downloading from: ${targetUrl}`);
 
-        // 2. FETCH WITH STRICT HEADERS
         const fileResponse = await fetch(targetUrl, {
             method: "GET",
-            headers: {
-                "Authorization": `Bearer ${this.env.SLACK_BOT_TOKEN}`
-            },
-            redirect: "follow" // Essential: Follow Slack's CDN redirects
+            headers: { "Authorization": `Bearer ${this.env.SLACK_BOT_TOKEN}` },
+            redirect: "follow"
         });
 
-        if (!fileResponse.ok) {
-            throw new Error(`Slack download failed: status ${fileResponse.status}`);
-        }
+        if (!fileResponse.ok) throw new Error(`Slack download failed: status ${fileResponse.status}`);
 
-        // 3. DEBUG: Check what we actually got
-        const contentType = fileResponse.headers.get("Content-Type");
-        console.log(`🔎 Content-Type received: ${contentType}`);
-
-        // 4. READ AS BUFFER
         const arrayBuffer = await fileResponse.arrayBuffer();
 
-        // 5. CRITICAL CHECK: Verify Magic Bytes (%PDF)
-        // This looks at the first 5 bytes of the file. 
-        // A real PDF *always* starts with "%PDF-"
+        // Header Check
         const headerBytes = new Uint8Array(arrayBuffer.slice(0, 5));
         const headerString = new TextDecoder().decode(headerBytes);
-
         if (headerString !== "%PDF-") {
-            // If we see "<!DOC" or "<html", we know it's an auth error page
-            console.error(`❌ Invalid Header: '${headerString}'`);
-            throw new Error(
-                `Download verification failed. Expected '%PDF-' but got '${headerString}'. ` +
-                `This is usually an HTML Login page. Check your SLACK_BOT_TOKEN scopes.`
-            );
+            throw new Error(`Invalid PDF header: ${headerString}. Check Bot Scopes.`);
         }
 
-        // 6. NOW it is safe to parse
         const pdfData = new Uint8Array(arrayBuffer);
 
-        // Wrap unpdf in a try/catch block for corrupt files
+        // === PDF FIX: Handle string vs array return types ===
         let text = "";
         try {
             const result = await extractText(pdfData);
-            text = result.text.join("\n");
+            // unpdf extractText usually returns a string, but if it returns an array in some versions:
+            text = Array.isArray(result.text) ? result.text.join("\n") : result.text;
         } catch (e: any) {
             throw new Error(`PDF Parsing failed: ${e.message}`);
         }
 
-        if (!text || text.trim().length === 0) {
-            throw new Error("PDF text is empty. It might be a scanned image.");
-        }
+        if (!text || text.trim().length === 0) throw new Error("PDF text is empty.");
 
-        console.log(`✅ Text Extracted: ${text.length} chars`);
-
-        // 7. Chunk and Save (Existing Logic)
         const chunks = this.splitText(text, 1000, 100);
 
         for (let i = 0; i < chunks.length; i += 5) {
             const batch = chunks.slice(i, i + 5);
+            const { data } = await this.env.AI.run("@cf/baai/bge-base-en-v1.5", { text: batch });
 
-            // Generate Embeddings
-            const { data } = await this.env.AI.run("@cf/baai/bge-base-en-v1.5", {
-                text: batch
-            });
-
-            // Save to Vector DB
             const vectors = batch.map((chunkText, idx) => ({
                 id: `${file.id}-chunk-${i + idx}`,
                 values: data[idx],
-                metadata: {
-                    source: file.title,
-                    content: chunkText
-                }
+                metadata: { source: file.title, content: chunkText }
             }));
-
             await this.env.VECTOR_INDEX.upsert(vectors);
         }
     }
 
-    // Simple Splitter Helper
     splitText(text: string, chunkSize: number, overlap: number) {
         const chunks = [];
         let start = 0;
@@ -271,123 +217,170 @@ export class ChatRoom extends DurableObject<Env> {
         }
         return chunks;
     }
+
     // =========================================
-    // NEW HELPER FUNCTIONS
+    // HELPER FUNCTIONS
     // =========================================
 
-    /**
-     * Uses the text Gemini model to act as an "Art Director", creating a
-     * detailed visual description based on the factual text reply.
-     */
     async createInfographicPrompt(userQuery: string, factualReply: string): Promise<string> {
         const artDirectorSystemPrompt = `
-You are an expert AI Art Director specializing in educational infographics.
-Your goal is to take a textual explanation and translate it into a detailed, visually rich prompt for an image generation model.
-
+You are an expert AI Art Director. Create a prompt for an image generation model.
 Guidelines:
-1.  **Visual Style:** Clean, modern digital infographic style. Use a professional color palette (blues, purples, unobtrusive greys).
-2.  **Structure:** Use visual metaphors like flowcharts, connected boxes, contrasting columns, or central hub diagrams depending on the content.
-3.  **Text in Image:** You MUST include specific, short, accurate text labels inside the description that should appear in the image.
-4.  **Accuracy:** The visual elements must accurately reflect the provided factual reply.
-
-Identify the key concepts in the "Factual Reply" and design a visual layout that explains them.
-Output ONLY the final detailed image prompt string.
+1. Visual Style: Modern digital infographic, clean blue/purple palette.
+2. Content: Visualize the key concepts from the "Factual Reply".
+3. Output: ONLY the detailed prompt string.
 `;
+        const artPrompt = `QUERY: ${userQuery}\nREPLY: ${factualReply}`;
 
-        const artPrompt = `
-USER QUERY: ${userQuery}
-FACTUAL REPLY: ${factualReply}
+        // Use a stable model for this logic step
+        const modelName4ImagePrompt = "gemini-2.5-flash";
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelName4ImagePrompt}:generateContent?key=${this.env.GEMINI_API_KEY}`;
 
-Create the detailed image generation prompt now:
-`;
-
-        // We use a fast, cheap model for this intermediate step
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${this.env.GEMINI_API_KEY}`;
         const response = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
                 system_instruction: { parts: [{ text: artDirectorSystemPrompt }] },
                 contents: [{ role: "user", parts: [{ text: artPrompt }] }],
-                generationConfig: { temperature: 0.7 } // Slightly higher temp for creativity in layout
+                generationConfig: { temperature: 0.7 },
+                // === NEW: DISABLE SAFETY FILTERS ===
+                // This is required for topics like DefenseTech or Strategy
+                safetySettings: [
+                    { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+                    { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+                ]
             }),
         });
+
         const data: any = await response.json();
+
+        // Debugging: Log the full response to see "promptFeedback" if it fails
+        if (!data.candidates || !data.candidates[0]) {
+            console.error("Art Director Failed. Full API Response:", JSON.stringify(data, null, 2));
+
+            // Extract the specific reason if available
+            const blockReason = data.promptFeedback?.blockReason;
+            if (blockReason) {
+                throw new Error(`Gemini Safety Block: ${blockReason}. (Try checking Cloudflare logs for details)`);
+            }
+
+            throw new Error(`API Error: ${data.error?.message || "Unknown error"}`);
+        }
+
         return data.candidates[0].content.parts[0].text.trim();
     }
 
+    async generateAndUploadImage(
+        imagePrompt: string,
+        channelId: string,
+        threadTs: string,
+        modelName: string
+    ) {
+        const googleImageUrl =
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent` +
+            `?key=${this.env.GEMINI_API_KEY}`;
 
-    /**
-     * Calls Google's Image API, gets base64 data, turns it into a file, 
-     * and uploads it to Slack.
-     */
-    async generateAndUploadImage(imagePrompt: string, channelId: string, threadTs: string, modelName: string) {
-        // 1. Call Google Image Generation API
-        // Note: The API endpoint and payload structure for image generation often differs from text.
-        // This uses the structure common for Imagen on Vertex/AI Studio REST API.
-        const googleImageUrl = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:predict?key=${this.env.GEMINI_API_KEY}`;
-        
+        console.log(`Generating image with ${modelName}...`);
+
         const imageResponse = await fetch(googleImageUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-                instances: [{ prompt: imagePrompt }],
-                parameters: {
-                    sampleCount: 1,
-                    aspectRatio: "16:9" // Good for infographics
+                contents: [
+                    {
+                        parts: [{ text: imagePrompt }]
+                    }
+                ],
+                // Optional, supported for image models to explicitly ask for images
+                generationConfig: {
+                    response_modalities: ["IMAGE"]
+                    // You can add other knobs like temperature here if desired
                 }
             })
         });
 
         if (!imageResponse.ok) {
             const errText = await imageResponse.text();
-            throw new Error(`Google Image API failed: ${imageResponse.status} - ${errText}`);
+            throw new Error(
+                `Google Image API Error (${imageResponse.status}): ${errText}`
+            );
         }
 
         const imageData: any = await imageResponse.json();
-        // Google usually returns base64 image data in this structure
-        const base64Image = imageData.predictions?.[0]?.bytesBase64;
+
+        // Extract first image part (inlineData.data is base64, inlineData.mimeType is e.g. image/png)
+        const parts =
+            imageData.candidates?.[0]?.content?.parts ??
+            imageData.contents?.[0]?.parts ??
+            [];
+        const imagePart = parts.find((p: any) => p.inlineData || p.inline_data);
+
+        if (!imagePart) {
+            console.error("No image part found. Response:", JSON.stringify(imageData));
+            throw new Error("API returned success but no image data found.");
+        }
+
+        const inline = imagePart.inlineData || imagePart.inline_data;
+        const base64Image = inline.data;
+        const mimeType = inline.mimeType || inline.mime_type || "image/png";
 
         if (!base64Image) {
-            throw new Error("No image data found in Google API response");
+            console.error("No base64 data in inlineData. Response:", JSON.stringify(imageData));
+            throw new Error("Image part present but contained no data.");
         }
 
-        // 2. Convert Base64 to Binary Buffer for upload
-        // We need to use Cloudflare's Buffer global (requires nodejs_compat flag in wrangler.toml)
-        const binaryImg = Buffer.from(base64Image, 'base64');
+        const binaryImg = Buffer.from(base64Image, "base64");
 
-        // 3. Upload to Slack
-        // Slack requires multipart/form-data for file uploads
-        const formData = new FormData();
-        formData.append("token", this.env.SLACK_BOT_TOKEN);
-        formData.append("channels", channelId);
-        // Use a Blob to append the binary data with filename and type
-        formData.append("file", new Blob([binaryImg], { type: 'image/png' }), "infographic.png");
-        formData.append("title", "Generated Infographic");
-        if (threadTs) formData.append("thread_ts", threadTs); // Keep it in the thread
-
-        const slackUploadReq = await fetch("https://slack.com/api/files.upload", {
-            method: "POST",
-            // Do NOT set Content-Type header manually; fetch sets boundary automatically for FormData
-            body: formData
+        // STEP A: Get Upload URL from Slack
+        const getUrlParams = new URLSearchParams({
+            filename: "infographic.png",
+            length: binaryImg.byteLength.toString()
         });
 
-        const slackResponse: any = await slackUploadReq.json();
-        if (!slackResponse.ok) {
-            throw new Error(`Slack upload failed: ${slackResponse.error}`);
+        const urlRes = await fetch(`https://slack.com/api/files.getUploadURLExternal?${getUrlParams}`, {
+            method: "GET",
+            headers: { "Authorization": `Bearer ${this.env.SLACK_BOT_TOKEN}` }
+        });
+
+        const urlData: any = await urlRes.json();
+        if (!urlData.ok) throw new Error(`Slack V2 Step A failed: ${urlData.error}`);
+
+        const { upload_url, file_id } = urlData;
+
+        // STEP B: Upload the actual binary data to the provided URL
+        // Note: Do NOT use the Bot Token here. Just raw POST to the specific URL.
+        const uploadRes = await fetch(upload_url, {
+            method: "POST",
+            body: binaryImg
+        });
+
+        if (!uploadRes.ok) throw new Error("Slack V2 Step B (Binary Upload) failed");
+
+        // STEP C: Complete the upload and share to channel
+        const completeBody: any = {
+            files: [{ "id": file_id, "title": "Generated Infographic" }],
+            channel_id: channelId
+        };
+
+        // Add thread_ts if responding in a thread
+        if (threadTs) completeBody.thread_ts = threadTs;
+
+        const completeRes = await fetch("https://slack.com/api/files.completeUploadExternal", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${this.env.SLACK_BOT_TOKEN}`
+            },
+            body: JSON.stringify(completeBody)
+        });
+
+        const completeData: any = await completeRes.json();
+        if (!completeData.ok) {
+            throw new Error(`Slack V2 Step C failed: ${completeData.error}`);
         }
     }
-
-    // async postToSlack(channel: string, text: string) {
-    //     await fetch("https://slack.com/api/chat.postMessage", {
-    //         method: "POST",
-    //         headers: {
-    //             "Content-Type": "application/json",
-    //             "Authorization": `Bearer ${this.env.SLACK_BOT_TOKEN}`,
-    //         },
-    //         body: JSON.stringify({ channel, text }),
-    //     });
-    // }
 
     async postToSlack(channel: string, text: string, threadTs?: string) {
         const body: any = { channel, text };
