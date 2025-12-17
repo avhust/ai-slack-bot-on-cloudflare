@@ -7,6 +7,9 @@
 	"name": "whatsapp-bot",
 	"main": "src/index.ts",
 	"compatibility_date": "2025-12-13",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
 	"observability": {
 		"enabled": true
 	},
@@ -36,7 +39,17 @@ new_sqlite_classes = ["ChatRoom"] # Enables SQLite for this class
 				"ChatRoom"
 			]
 		}
-	]
+	],
+	"vectorize": [
+		{
+			"binding": "VECTOR_INDEX",
+			"index_name": "strategy-index",
+			"remote": true
+		}
+	],
+	"ai": {
+		"binding": "AI"
+	}
 	/*
 
 

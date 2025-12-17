@@ -60,12 +60,14 @@ export class ChatRoom extends DurableObject<Env> {
       },
       body: JSON.stringify({
         model: "gpt-4o-mini",
+        // model: "gpt-5.2-chat-latest",
         messages,
         temperature: 0.3, // Lower temperature = more deterministic / less creative
       }),
     });
 
     const data: any = await openAiResponse.json();
+    console.log(data);
     const reply = data.choices[0].message.content;
 
     // 5. Save Assistant Response

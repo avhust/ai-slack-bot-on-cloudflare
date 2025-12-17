@@ -7,6 +7,8 @@ export interface Env {
   SLACK_BOT_TOKEN: string;
   OPENAI_API_KEY: string;
   GEMINI_API_KEY: string;
+  VECTOR_INDEX: VectorizeIndex;
+  AI: any;
 }
 
 export default {
