@@ -57,11 +57,11 @@ export class ChatRoom extends DurableObject<Env> {
         "Content-Type": "application/json",
         "Authorization": `Bearer ${this.env.OPENAI_API_KEY}`,
       },
-      body: JSON.stringify({ 
-        model: "gpt-4o-mini", 
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
         messages,
         temperature: 0.3, // Lower temperature = more deterministic / less creative
-       }),
+      }),
     });
 
     const data: any = await openAiResponse.json();
