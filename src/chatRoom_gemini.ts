@@ -1,9 +1,8 @@
-// src/chatRoom.ts
 import { DurableObject } from "cloudflare:workers";
 import { Env } from "./index";
 import { STRATEGY_CONTEXT, SYSTEM_INSTRUCTIONS } from "./knowledge";
 import { MESSAGES_LIMIT } from "./const.js";
-import { extractText } from "unpdf"; // Ensure we use the PDF.js driver
+import { extractText } from "unpdf";
 
 export class ChatRoom extends DurableObject<Env> {
     constructor(ctx: DurableObjectState, env: Env) {
@@ -112,7 +111,7 @@ export class ChatRoom extends DurableObject<Env> {
             body: JSON.stringify({
                 system_instruction: systemInstruction,
                 contents: contents,
-                generationConfig: { temperature: 0.3 }
+                generationConfig: { temperature: 0.7 }
             }),
         });
 

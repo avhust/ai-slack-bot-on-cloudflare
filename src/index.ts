@@ -1,5 +1,5 @@
 // src/index.ts
-import { WorkerEntrypoint } from "cloudflare:workers";
+import { ChatRoom } from "./chatRoom_gemini.js";
 
 export interface Env {
   CHAT_DO: DurableObjectNamespace;
@@ -13,7 +13,11 @@ export interface Env {
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    if (request.method !== "POST") return new Response("Method not allowed", { status: 405 });
+    // const url = new URL(request.url);
+
+    if (request.method !== "POST") {
+      return new Response("Method not allowed", { status: 405 });
+    }
 
     const body = await request.text();
 
@@ -25,29 +29,22 @@ export default {
       });
     }
 
-    // 2. Verify Request Signature (Security)
-    // IMPORTANT: Implement verifySlackSignature here (omitted for brevity, see Slack docs)
-    // if (!await verifySlackSignature(request, body, env.SLACK_SIGNING_SECRET)) {
-    //   return new Response("Unauthorized", { status: 401 });
-    // }
-
-    // 3. Prevent bot recursion
+    // 2. Prevent bot recursion
     if (event?.bot_id || type !== "event_callback") {
       return new Response("Ignored");
     }
 
-    // 4. Route to Durable Object based on Channel or Thread ID
-    // We use the channel ID as the unique ID for the DO.
+    // 3. Route to Durable Object based on Channel ID
     const id = env.CHAT_DO.idFromName(event.channel);
-    const stub = env.CHAT_DO.get(id);
+    // const stub = env.CHAT_DO.get(id);
+    const stub = env.CHAT_DO.get(id) as DurableObjectStub<ChatRoom>
 
-    // 5. Asynchronously process the message so we can return 200 OK instantly
+    // 4. Asynchronously process the message
     ctx.waitUntil(stub.handleMessage(event));
 
     return new Response("OK");
   },
 };
 
-// Re-export the Durable Object class so Cloudflare finds it
+// Re-export the Durable Object class
 export { ChatRoom } from "./chatRoom_gemini.js";
-// export { ChatRoom } from "./chatRoom_openai.js";
